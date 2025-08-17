@@ -1,0 +1,695 @@
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+
+#include "cuda_runtime.h"
+#include "device_launch_parameters.h"
+
+// --- Basic fixed-size big integer types (little-endian 32-bit words) ---
+struct Big256 { uint32_t w[8]; };
+struct Big512 { uint32_t w[16]; };
+
+// helpers
+__device__ inline void big256_set_zero(Big256& a) { for (int i = 0; i < 8; i++) a.w[i] = 0; }
+__device__ inline void big512_set_zero(Big512& a) { for (int i = 0; i < 16; i++) a.w[i] = 0; }
+__device__ inline void copy256(const Big256& src, Big256& dst) { for (int i = 0; i < 8; i++) dst.w[i] = src.w[i]; }
+
+// clz wrapper
+__device__ inline int clz32(uint32_t x) {
+    if (x == 0) return 32;
+    return __clz(x);
+}
+
+// compare
+__device__ inline int cmp256(const Big256& a, const Big256& b) {
+    for (int i = 7; i >= 0; i--) {
+        if (a.w[i] < b.w[i]) return -1;
+        if (a.w[i] > b.w[i]) return 1;
+    }
+    return 0;
+}
+
+// add (mod 2^256)
+__device__ inline void add256(const Big256& a, const Big256& b, Big256& r) {
+    uint64_t carry = 0;
+    for (int i = 0; i < 8; i++) {
+        uint64_t t = (uint64_t)a.w[i] + b.w[i] + carry;
+        r.w[i] = (uint32_t)t;
+        carry = t >> 32;
+    }
+}
+
+// sub (assume a >= b)
+__device__ inline void sub256(const Big256& a, const Big256& b, Big256& r) {
+    uint64_t borrow = 0;
+    for (int i = 0; i < 8; i++) {
+        uint64_t av = (uint64_t)a.w[i];
+        uint64_t bv = (uint64_t)b.w[i] + borrow;
+        if (av >= bv) { r.w[i] = (uint32_t)(av - bv); borrow = 0; }
+        else { r.w[i] = (uint32_t)((1ULL << 32) + av - bv); borrow = 1; }
+    }
+}
+
+// multiply (schoolbook): Big256 * Big256 -> Big512
+__device__ inline void mul256(const Big256& a, const Big256& b, Big512& c) {
+    for (int i = 0; i < 16; i++) c.w[i] = 0;
+    for (int i = 0; i < 8; i++) {
+        uint64_t carry = 0;
+        for (int j = 0; j < 8; j++) {
+            uint64_t t = (uint64_t)a.w[i] * b.w[j] + c.w[i + j] + carry;
+            c.w[i + j] = (uint32_t)t;
+            carry = t >> 32;
+        }
+        c.w[i + 8] = (uint32_t)carry;
+    }
+}
+
+// copy lower half of Big512 to Big256
+__device__ inline void low512_to256(const Big512& a, Big256& r) {
+    for (int i = 0; i < 8; i++) r.w[i] = a.w[i];
+}
+
+// left-shift Big256 by whole words into Big512: out = (a << (32*wordshift))
+__device__ inline void shift256_to512_words(const Big256& a, int wordshift, Big512& out) {
+    big512_set_zero(out);
+    for (int i = 0; i < 8; i++) out.w[i + wordshift] = a.w[i];
+}
+
+// left shift by bits (<32) into Big512 at word offset
+__device__ inline void shift_left_bits_into512(const Big256& src, int bits, int wordShift, Big512& out) {
+    big512_set_zero(out);
+    if (bits == 0) { for (int i = 0; i < 8; i++) out.w[i + wordShift] = src.w[i]; return; }
+    uint32_t carry = 0;
+    for (int i = 0; i < 8; i++) {
+        uint64_t t = ((uint64_t)src.w[i] << bits) | carry;
+        out.w[i + wordShift] = (uint32_t)t;
+        carry = (uint32_t)(t >> 32);
+    }
+    out.w[8 + wordShift] = carry;
+}
+
+// basic Big512 subtraction: a -= b, assume a >= b
+__device__ inline void sub512(Big512& a, const Big512& b) {
+    uint64_t borrow = 0;
+    for (int i = 0; i < 16; i++) {
+        uint64_t av = (uint64_t)a.w[i];
+        uint64_t bv = (uint64_t)b.w[i] + borrow;
+        if (av >= bv) { a.w[i] = (uint32_t)(av - bv); borrow = 0; }
+        else { a.w[i] = (uint32_t)((1ULL << 32) + av - bv); borrow = 1; }
+    }
+}
+
+// find msb of Big512
+__device__ inline int msb512(const Big512& a) {
+    for (int i = 15; i >= 0; i--) {
+        if (a.w[i]) {
+            return i * 32 + (31 - clz32(a.w[i]));
+        }
+    }
+    return -1;
+}
+
+// --- secp256k1 prime p (little-endian 32-bit words) ---
+__device__ inline void get_secp256k1_p(Big256& p) {
+    const uint32_t p_words[8] = {
+        0xFFFFFC2Fu, 0xFFFFFFFEu, 0xFFFFFFFFu, 0xFFFFFFFFu,
+        0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu
+    };
+    for (int i = 0; i < 8; i++) p.w[i] = p_words[i];
+}
+
+// Optimized reduction for p = 2^256 - 2^32 - 977
+__device__ inline void reduce_secp256k1(const Big512& prod, Big256& out) {
+    auto add_word = [](uint32_t& dst, uint64_t add, uint64_t& carry) {
+        uint64_t s = (uint64_t)dst + add + carry;
+        dst = (uint32_t)s;
+        carry = s >> 32;
+        };
+
+    auto fold_once = [&](const Big512& in, Big512& out512) {
+        Big256 H; for (int i = 0; i < 8; ++i) H.w[i] = in.w[8 + i];
+
+        for (int i = 0; i < 16; ++i) out512.w[i] = 0;
+        for (int i = 0; i < 8; ++i) out512.w[i] = in.w[i];
+
+        uint64_t carry = 0;
+        for (int i = 1; i < 16; ++i) {
+            uint64_t add = (i - 1 < 8) ? (uint64_t)H.w[i - 1] : 0;
+            add_word(out512.w[i], add, carry);
+        }
+
+        carry = 0;
+        for (int i = 0; i < 8; ++i) {
+            uint64_t add = (uint64_t)H.w[i] * 977ull;
+            uint64_t s = (uint64_t)out512.w[i] + (uint32_t)add + carry;
+            out512.w[i] = (uint32_t)s;
+            carry = (s >> 32) + (add >> 32);
+        }
+        for (int i = 8; i < 16 && carry; ++i) {
+            uint64_t s = (uint64_t)out512.w[i] + carry;
+            out512.w[i] = (uint32_t)s;
+            carry = s >> 32;
+        }
+        };
+
+    Big512 t1; fold_once(prod, t1);
+    Big512 t2; fold_once(t1, t2);
+
+    for (int i = 0; i < 8; ++i) out.w[i] = t2.w[i];
+
+    Big256 P; get_secp256k1_p(P);
+    for (int k = 0; k < 2; ++k) {
+        if (cmp256(out, P) >= 0) {
+            Big256 tmp; sub256(out, P, tmp);
+            copy256(tmp, out);
+        }
+        else break;
+    }
+}
+
+// modular multiply & square using optimized reduction
+__device__ inline void modmul(const Big256& a, const Big256& b, Big256& r) {
+    Big512 prod; mul256(a, b, prod);
+    reduce_secp256k1(prod, r);
+}
+__device__ inline void modsquare(const Big256& a, Big256& r) { modmul(a, a, r); }
+
+// --- exponent p-2 (device constant) ---
+__device__ __constant__ Big256 EXP_P_MINUS_2 = {
+    { 0xFFFFFC2Du, 0xFFFFFFFEu, 0xFFFFFFFFu, 0xFFFFFFFFu,
+      0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu }
+};
+
+// modular exponentiation with big exponent
+__device__ inline void modexp_with_bigexp(const Big256& base, const Big256& exp, Big256& r) {
+    Big256 acc; big256_set_zero(acc); acc.w[0] = 1;
+
+    for (int wi = 7; wi >= 0; --wi) {
+        uint32_t w = exp.w[wi];
+        for (int bi = 31; bi >= 0; --bi) {
+            Big256 acc2; modsquare(acc, acc2);
+            copy256(acc2, acc);
+            if ((w >> bi) & 1u) {
+                Big256 tmp; modmul(acc, base, tmp);
+                copy256(tmp, acc);
+            }
+        }
+    }
+    copy256(acc, r);
+}
+
+__device__ inline void modinv(const Big256& a, Big256& r) {
+    modexp_with_bigexp(a, EXP_P_MINUS_2, r);
+}
+
+// --- curve base point G as device-constant Big256 values ---
+__device__ __constant__ Big256 Gx_const = {
+    { 0x16F81798u, 0x59F2815Bu, 0x2DCE28D9u, 0x029BFCDBu,
+      0xCE870B07u, 0x55A06295u, 0xF9DCBBACu, 0x79BE667Eu }
+};
+__device__ __constant__ Big256 Gy_const = {
+    { 0xFB10D4B8u, 0x9C47D08Fu, 0xA6855419u, 0xFD17B448u,
+      0x0E1108A8u, 0x5DA4FBFCu, 0x26A3C465u, 0x483ADA77u }
+};
+
+__device__ inline void get_curve_G(Big256& Gx, Big256& Gy) {
+    copy256(Gx_const, Gx);
+    copy256(Gy_const, Gy);
+}
+
+// add mod p : r = (a + b) mod p
+__device__ inline void addmod_p(const Big256& a, const Big256& b, Big256& r) {
+    uint64_t carry = 0;
+    for (int i = 0; i < 8; i++) {
+        uint64_t t = (uint64_t)a.w[i] + b.w[i] + carry;
+        r.w[i] = (uint32_t)t;
+        carry = t >> 32;
+    }
+    Big256 P; get_secp256k1_p(P);
+    if (carry || cmp256(r, P) >= 0) {
+        Big256 t; sub256(r, P, t);
+        copy256(t, r);
+    }
+}
+
+// sub mod p : r = (a - b) mod p
+__device__ inline void submod_p(const Big256& a, const Big256& b, Big256& r) {
+    uint64_t borrow = 0;
+    for (int i = 0; i < 8; i++) {
+        uint64_t av = (uint64_t)a.w[i];
+        uint64_t bv = (uint64_t)b.w[i] + borrow;
+        if (av >= bv) { r.w[i] = (uint32_t)(av - bv); borrow = 0; }
+        else { r.w[i] = (uint32_t)((1ULL << 32) + av - bv); borrow = 1; }
+    }
+    if (borrow) {
+        Big256 P; get_secp256k1_p(P);
+        Big256 t; add256(r, P, t);
+        copy256(t, r);
+    }
+}
+
+// --- Jacobian point ---
+struct PointJ { Big256 X, Y, Z; };
+
+__device__ inline bool is_infty(const PointJ& p) {
+    for (int i = 0; i < 8; i++) if (p.Z.w[i] != 0) return false;
+    return true;
+}
+
+__device__ inline void to_jacobian(const Big256& x, const Big256& y, PointJ& out) {
+    copy256(x, out.X);
+    copy256(y, out.Y);
+    big256_set_zero(out.Z);
+    out.Z.w[0] = 1;
+}
+
+__device__ inline void from_jacobian(const PointJ& p, Big256& ax, Big256& ay) {
+    if (is_infty(p)) { big256_set_zero(ax); big256_set_zero(ay); return; }
+    Big256 zinv; modinv(p.Z, zinv);
+    Big256 zinv2; modsquare(zinv, zinv2);
+    Big256 zinv3; modmul(zinv2, zinv, zinv3);
+    modmul(p.X, zinv2, ax);
+    modmul(p.Y, zinv3, ay);
+}
+
+// Optimized Jacobian double
+__device__ inline void jacobian_double(const PointJ& p, PointJ& r_out) {
+    if (is_infty(p)) { r_out = p; return; }
+
+    Big256 Y2, XY2, X2, M, M2, Y4;
+    modsquare(p.Y, Y2);
+    modmul(p.X, Y2, XY2);
+    modsquare(p.X, X2);
+
+    Big256 threeX2;
+    addmod_p(X2, X2, threeX2);
+    addmod_p(threeX2, X2, M);
+
+    Big256 S;
+    addmod_p(XY2, XY2, S);
+    addmod_p(S, S, S);
+
+    modsquare(M, M2);
+    modsquare(Y2, Y4);
+
+    Big256 nx;
+    Big256 twoS; addmod_p(S, S, twoS);
+    submod_p(M2, twoS, nx);
+
+    Big256 ny;
+    Big256 S_minus_nx; submod_p(S, nx, S_minus_nx);
+    Big256 nytmp; modmul(M, S_minus_nx, nytmp);
+    Big256 eightY4;
+    addmod_p(Y4, Y4, eightY4);
+    addmod_p(eightY4, eightY4, eightY4);
+    addmod_p(eightY4, eightY4, eightY4);
+    submod_p(nytmp, eightY4, ny);
+
+    Big256 nz;
+    Big256 YZ; modmul(p.Y, p.Z, YZ);
+    addmod_p(YZ, YZ, nz);
+
+    copy256(nx, r_out.X); copy256(ny, r_out.Y); copy256(nz, r_out.Z);
+}
+
+__device__ inline void jacobian_add(const PointJ& p, const PointJ& q, PointJ& r_out) {
+    if (is_infty(p)) { r_out = q; return; }
+    if (is_infty(q)) { r_out = p; return; }
+
+    Big256 Z2sq; modsquare(q.Z, Z2sq);
+    Big256 U1;   modmul(p.X, Z2sq, U1);
+
+    Big256 Z1sq; modsquare(p.Z, Z1sq);
+    Big256 U2;   modmul(q.X, Z1sq, U2);
+
+    Big256 Z2cu; modmul(Z2sq, q.Z, Z2cu);
+    Big256 S1;   modmul(p.Y, Z2cu, S1);
+
+    Big256 Z1cu; modmul(Z1sq, p.Z, Z1cu);
+    Big256 S2;   modmul(q.Y, Z1cu, S2);
+
+    if (cmp256(U1, U2) == 0) {
+        if (cmp256(S1, S2) != 0) { big256_set_zero(r_out.X); big256_set_zero(r_out.Y); big256_set_zero(r_out.Z); return; }
+        else { jacobian_double(p, r_out); return; }
+    }
+
+    Big256 H; submod_p(U2, U1, H);
+    Big256 R; submod_p(S2, S1, R);
+
+    Big256 H2; modsquare(H, H2);
+    Big256 H3; modmul(H2, H, H3);
+    Big256 U1H2; modmul(U1, H2, U1H2);
+
+    Big256 R2; modsquare(R, R2);
+    Big256 tmp1; submod_p(R2, H3, tmp1);
+
+    Big256 twoU1H2; addmod_p(U1H2, U1H2, twoU1H2);
+    Big256 nx; submod_p(tmp1, twoU1H2, nx);
+
+    Big256 U1H2_minus_nx; submod_p(U1H2, nx, U1H2_minus_nx);
+    Big256 Rmul;  modmul(R, U1H2_minus_nx, Rmul);
+    Big256 S1H3;  modmul(S1, H3, S1H3);
+    Big256 ny;    submod_p(Rmul, S1H3, ny);
+
+    Big256 nz; modmul(H, p.Z, nz); modmul(nz, q.Z, nz);
+
+    copy256(nx, r_out.X); copy256(ny, r_out.Y); copy256(nz, r_out.Z);
+}
+
+// scalar multiply (simple double-and-add)
+__device__ inline void scalar_mul(const PointJ& base, const Big256& scalar, PointJ& res) {
+    big256_set_zero(res.X); big256_set_zero(res.Y); big256_set_zero(res.Z);
+    PointJ R = res;
+    PointJ addp = base;
+    for (int wi = 7; wi >= 0; --wi) {
+        uint32_t w = scalar.w[wi];
+        for (int b = 31; b >= 0; --b) {
+            jacobian_double(R, R);
+            if ((w >> b) & 1u) jacobian_add(R, addp, R);
+        }
+    }
+    res = R;
+}
+
+// SHA-256 CUDA Implementation
+__device__ __constant__ uint32_t K256_cuda[64] = {
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+};
+
+__device__ inline uint32_t rotr32(uint32_t x, int n) {
+    return (x >> n) | (x << (32 - n));
+}
+
+__device__ inline void sha256_compress_cuda(uint32_t state[8], const uint8_t block[64]) {
+    uint32_t w[64];
+
+    for (int i = 0; i < 16; i++) {
+        w[i] = ((uint32_t)block[i * 4] << 24) | ((uint32_t)block[i * 4 + 1] << 16) |
+            ((uint32_t)block[i * 4 + 2] << 8) | (uint32_t)block[i * 4 + 3];
+    }
+
+    for (int i = 16; i < 64; i++) {
+        uint32_t s0 = rotr32(w[i - 15], 7) ^ rotr32(w[i - 15], 18) ^ (w[i - 15] >> 3);
+        uint32_t s1 = rotr32(w[i - 2], 17) ^ rotr32(w[i - 2], 19) ^ (w[i - 2] >> 10);
+        w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+    }
+
+    uint32_t a = state[0], b = state[1], c = state[2], d = state[3];
+    uint32_t e = state[4], f = state[5], g = state[6], h = state[7];
+
+    for (int i = 0; i < 64; i++) {
+        uint32_t S1 = rotr32(e, 6) ^ rotr32(e, 11) ^ rotr32(e, 25);
+        uint32_t ch = (e & f) ^ ((~e) & g);
+        uint32_t temp1 = h + S1 + ch + K256_cuda[i] + w[i];
+        uint32_t S0 = rotr32(a, 2) ^ rotr32(a, 13) ^ rotr32(a, 22);
+        uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
+        uint32_t temp2 = S0 + maj;
+
+        h = g;
+        g = f;
+        f = e;
+        e = d + temp1;
+        d = c;
+        c = b;
+        b = a;
+        a = temp1 + temp2;
+    }
+
+    state[0] += a; state[1] += b; state[2] += c; state[3] += d;
+    state[4] += e; state[5] += f; state[6] += g; state[7] += h;
+}
+
+__device__ void sha256_cuda(const uint8_t* data, size_t len, uint8_t out[32]) {
+    uint32_t state[8] = {
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
+    };
+
+    uint8_t block[64];
+    size_t offset = 0;
+
+    while (offset + 64 <= len) {
+        memcpy(block, data + offset, 64);
+        sha256_compress_cuda(state, block);
+        offset += 64;
+    }
+
+    size_t remaining = len - offset;
+    memset(block, 0, 64);
+    if (remaining > 0) memcpy(block, data + offset, remaining);
+    block[remaining] = 0x80;
+
+    if (remaining >= 56) {
+        sha256_compress_cuda(state, block);
+        memset(block, 0, 64);
+    }
+
+    uint64_t bitlen = len * 8;
+    for (int i = 0; i < 8; i++) {
+        block[63 - i] = (uint8_t)(bitlen >> (i * 8));
+    }
+    sha256_compress_cuda(state, block);
+
+    for (int i = 0; i < 8; i++) {
+        out[i * 4] = (uint8_t)(state[i] >> 24);
+        out[i * 4 + 1] = (uint8_t)(state[i] >> 16);
+        out[i * 4 + 2] = (uint8_t)(state[i] >> 8);
+        out[i * 4 + 3] = (uint8_t)state[i];
+    }
+}
+
+// RIPEMD-160 CUDA Implementation
+__device__ inline uint32_t RIPEMD160_ROL(uint32_t x, unsigned int n) {
+    return (x << n) | (x >> (32 - n));
+}
+
+__device__ void ripemd160_cuda(const uint8_t* msg, size_t size, uint8_t out[20]) {
+    uint32_t h0 = 0x67452301UL;
+    uint32_t h1 = 0xEFCDAB89UL;
+    uint32_t h2 = 0x98BADCFEUL;
+    uint32_t h3 = 0x10325476UL;
+    uint32_t h4 = 0xC3D2E1F0UL;
+
+    for (size_t offset = 0; offset <= size; offset += 64) {
+        uint8_t block[64];
+        size_t remaining = size - offset;
+
+        if (remaining >= 64) {
+            memcpy(block, msg + offset, 64);
+        }
+        else {
+            memset(block, 0, 64);
+            if (remaining > 0) memcpy(block, msg + offset, remaining);
+            block[remaining] = 0x80;
+
+            if (remaining <= 55) {
+                uint64_t bitlen = size * 8;
+                for (int i = 0; i < 8; i++) {
+                    block[56 + i] = (uint8_t)(bitlen >> (i * 8));
+                }
+            }
+        }
+
+        uint32_t X[16];
+        for (int i = 0; i < 16; i++) {
+            X[i] = (uint32_t)block[i * 4] | ((uint32_t)block[i * 4 + 1] << 8) |
+                ((uint32_t)block[i * 4 + 2] << 16) | ((uint32_t)block[i * 4 + 3] << 24);
+        }
+
+        uint32_t A1 = h0, B1 = h1, C1 = h2, D1 = h3, E1 = h4;
+        uint32_t A2 = h0, B2 = h1, C2 = h2, D2 = h3, E2 = h4;
+
+        auto f = [](int j, uint32_t x, uint32_t y, uint32_t z)->uint32_t {
+            if (j <= 15) return x ^ y ^ z;
+            if (j <= 31) return (x & y) | (~x & z);
+            if (j <= 47) return (x | ~y) ^ z;
+            if (j <= 63) return (x & z) | (y & ~z);
+            return x ^ (y | ~z);
+            };
+
+        const unsigned int r1[80] = {
+          0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,
+          7,4,13,1,10,6,15,3,12,0,9,5,2,14,11,8,
+          3,10,14,4,9,15,8,1,2,7,0,6,13,11,5,12,
+          1,9,11,10,0,8,12,4,13,3,7,15,14,5,6,2,
+          4,0,5,9,7,12,2,10,14,1,3,8,11,6,15,13
+        };
+        const unsigned int r2[80] = {
+          5,14,7,0,9,2,11,4,13,6,15,8,1,10,3,12,
+          6,11,3,7,0,13,5,10,14,15,8,12,4,9,1,2,
+          15,5,1,3,7,14,6,9,11,8,12,2,10,0,4,13,
+          8,6,4,1,3,11,15,0,5,12,2,13,9,7,10,14,
+          12,15,10,4,1,5,8,7,6,2,13,14,0,3,9,11
+        };
+        const unsigned int s1[80] = {
+          11,14,15,12,5,8,7,9,11,13,14,15,6,7,9,8,
+          7,6,8,13,11,9,7,15,7,12,15,9,11,7,13,12,
+          11,13,6,7,14,9,13,15,14,8,13,6,5,12,7,5,
+          11,12,14,15,14,15,9,8,9,14,5,6,8,6,5,12,
+          9,15,5,11,6,8,13,12,5,12,13,14,11,8,5,6
+        };
+        const unsigned int s2[80] = {
+          8,9,9,11,13,15,15,5,7,7,8,11,14,14,12,6,
+          9,13,15,7,12,8,9,11,7,7,12,7,6,15,13,11,
+          9,7,15,11,8,6,6,14,12,13,5,14,13,13,7,5,
+          15,5,8,11,14,14,6,14,6,9,12,9,12,5,15,8,
+          8,5,12,9,12,5,14,6,8,13,6,5,15,13,11,11
+        };
+        const uint32_t K1[5] = { 0x00000000UL,0x5a827999UL,0x6ed9eba1UL,0x8f1bbcdcUL,0xa953fd4eUL };
+        const uint32_t K2[5] = { 0x50a28be6UL,0x5c4dd124UL,0x6d703ef3UL,0x7a6d76e9UL,0x00000000UL };
+
+        for (int j = 0; j < 80; j++) {
+            uint32_t T = RIPEMD160_ROL(A1 + f(j, B1, C1, D1) + X[r1[j]] + K1[j / 16], s1[j]) + E1;
+            A1 = E1; E1 = D1; D1 = RIPEMD160_ROL(C1, 10); C1 = B1; B1 = T;
+
+            uint32_t TT = RIPEMD160_ROL(A2 + f(79 - j, B2, C2, D2) + X[r2[j]] + K2[j / 16], s2[j]) + E2;
+            A2 = E2; E2 = D2; D2 = RIPEMD160_ROL(C2, 10); C2 = B2; B2 = TT;
+        }
+
+        uint32_t T = h1 + C1 + D2;
+        h1 = h2 + D1 + E2;
+        h2 = h3 + E1 + A2;
+        h3 = h4 + A1 + B2;
+        h4 = h0 + B1 + C2;
+        h0 = T;
+    }
+
+    out[0] = (uint8_t)(h0); out[1] = (uint8_t)(h0 >> 8); out[2] = (uint8_t)(h0 >> 16); out[3] = (uint8_t)(h0 >> 24);
+    out[4] = (uint8_t)(h1); out[5] = (uint8_t)(h1 >> 8); out[6] = (uint8_t)(h1 >> 16); out[7] = (uint8_t)(h1 >> 24);
+    out[8] = (uint8_t)(h2); out[9] = (uint8_t)(h2 >> 8); out[10] = (uint8_t)(h2 >> 16); out[11] = (uint8_t)(h2 >> 24);
+    out[12] = (uint8_t)(h3); out[13] = (uint8_t)(h3 >> 8); out[14] = (uint8_t)(h3 >> 16); out[15] = (uint8_t)(h3 >> 24);
+    out[16] = (uint8_t)(h4); out[17] = (uint8_t)(h4 >> 8); out[18] = (uint8_t)(h4 >> 16); out[19] = (uint8_t)(h4 >> 24);
+}
+
+// Base58 encoding
+__device__ const char* b58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+
+__device__ void base58_encode(const uint8_t* data, int size, char* out) {
+    uint8_t tmp[25];
+    memcpy(tmp, data, size);
+
+    int zeros = 0;
+    while (zeros < size && tmp[zeros] == 0) zeros++;
+
+    uint8_t buffer[25 * 138 / 100 + 1] = { 0 };
+    int buffer_size = 0;
+
+    for (int i = zeros; i < size; i++) {
+        uint32_t carry = tmp[i];
+        for (int j = 0; j < buffer_size; j++) {
+            carry += (uint32_t)buffer[j] * 256;
+            buffer[j] = (uint8_t)(carry % 58);
+            carry /= 58;
+        }
+        while (carry) {
+            buffer[buffer_size++] = (uint8_t)(carry % 58);
+            carry /= 58;
+        }
+    }
+
+    int out_pos = 0;
+    for (int i = 0; i < zeros; i++) {
+        out[out_pos++] = '1';
+    }
+    for (int i = buffer_size - 1; i >= 0; i--) {
+        out[out_pos++] = b58[buffer[i]];
+    }
+    out[out_pos] = '\0';
+}
+
+// Main kernel to compute address from private key
+__global__ void compute_address_kernel(const Big256* priv_key, char* address) {
+    // 1. Get base point G
+    Big256 Gx, Gy;
+    get_curve_G(Gx, Gy);
+
+    // 2. Compute public key (scalar multiplication)
+    PointJ G; to_jacobian(Gx, Gy, G);
+    PointJ pub_point;
+    scalar_mul(G, *priv_key, pub_point);
+
+    // 3. Convert to affine coordinates
+    Big256 pubx, puby;
+    from_jacobian(pub_point, pubx, puby);
+
+    // 4. Serialize public key (uncompressed format)
+    uint8_t pub_uncomp[65];
+    pub_uncomp[0] = 0x04;
+    for (int wi = 0; wi < 8; wi++) {
+        uint32_t wx = pubx.w[7 - wi];
+        uint32_t wy = puby.w[7 - wi];
+        pub_uncomp[1 + wi * 4] = (uint8_t)(wx >> 24);
+        pub_uncomp[2 + wi * 4] = (uint8_t)(wx >> 16);
+        pub_uncomp[3 + wi * 4] = (uint8_t)(wx >> 8);
+        pub_uncomp[4 + wi * 4] = (uint8_t)wx;
+        pub_uncomp[33 + wi * 4] = (uint8_t)(wy >> 24);
+        pub_uncomp[34 + wi * 4] = (uint8_t)(wy >> 16);
+        pub_uncomp[35 + wi * 4] = (uint8_t)(wy >> 8);
+        pub_uncomp[36 + wi * 4] = (uint8_t)wy;
+    }
+
+    // 5. Compute SHA-256 hash of public key
+    uint8_t sha_pub[32];
+    sha256_cuda(pub_uncomp, 65, sha_pub);
+
+    // 6. Compute RIPEMD-160 hash of SHA-256 result
+    uint8_t rip[20];
+    ripemd160_cuda(sha_pub, 32, rip);
+
+    // 7. Create address payload (version byte + hash160)
+    uint8_t payload[21];
+    payload[0] = 0x00; // version byte for mainnet
+    memcpy(payload + 1, rip, 20);
+
+    // 8. Compute checksum (double SHA-256 of payload)
+    uint8_t chk1[32], chk2[32];
+    sha256_cuda(payload, 21, chk1);
+    sha256_cuda(chk1, 32, chk2);
+
+    // 9. Build full address data (payload + checksum)
+    uint8_t address_data[25];
+    memcpy(address_data, payload, 21);
+    memcpy(address_data + 21, chk2, 4);
+
+    // 10. Base58 encode
+    base58_encode(address_data, 25, address);
+}
+
+int main() {
+    // Initialize private key (0x100 in hex)
+    Big256 priv_key = { 0 };
+    priv_key.w[0] = 0x100; // Little-endian representation of 0x100
+
+    // Allocate device memory
+    Big256* d_priv_key;
+    char* d_address;
+    cudaMalloc(&d_priv_key, sizeof(Big256));
+    cudaMalloc(&d_address, 36); // Enough space for Bitcoin address
+
+    // Copy private key to device
+    cudaMemcpy(d_priv_key, &priv_key, sizeof(Big256), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    compute_address_kernel << <1, 1 >> > (d_priv_key, d_address);
+
+    // Copy result back
+    char address[36] = { 0 };
+    cudaMemcpy(address, d_address, 36, cudaMemcpyDeviceToHost);
+
+    // Print result
+    printf("Private key: 0x0000000000000000000000000000000000000000000000000000000000000100\n");
+    printf("Address: %s\n", address);
+
+    // Cleanup
+    cudaFree(d_priv_key);
+    cudaFree(d_address);
+
+    return 0;
+}
